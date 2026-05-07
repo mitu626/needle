@@ -11,6 +11,7 @@ rank=0 binds ZMQ sockets; rank=1..N-1 connect to rank=0's broadcast addr.
 from __future__ import annotations
 
 import multiprocessing as mp
+import socket
 import sys
 import time
 from typing import Optional
@@ -22,15 +23,40 @@ from .utils.logging import get_logger
 logger = get_logger(__name__)
 
 
+def _find_free_port() -> int:
+    """Return a free TCP port on localhost."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        return s.getsockname()[1]
+
+
+def _find_free_ports(n: int) -> list:
+    """Return n distinct free TCP ports, keeping sockets open until all are selected."""
+    socks = []
+    ports = []
+    for _ in range(n):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.bind(("127.0.0.1", 0))
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        ports.append(s.getsockname()[1])
+        socks.append(s)
+    for s in socks:
+        s.close()
+    return ports
+
+
 def launch(
     model_path: str,
     tp_size: int = 1,
-    # ZMQ
-    zmq_backend_addr: str = "tcp://127.0.0.1:5555",
-    zmq_result_addr: str  = "tcp://127.0.0.1:5556",
-    zmq_broadcast_addr: str = "tcp://127.0.0.1:5557",
-    # Distributed rendezvous (for NCCL/gloo)
-    distributed_addr: str = "tcp://127.0.0.1:29500",
+    # ZMQ — auto-select free ports if None
+    zmq_backend_addr: Optional[str] = None,
+    zmq_result_addr: Optional[str]  = None,
+    zmq_broadcast_addr: Optional[str] = None,
+    # Distributed rendezvous (for NCCL/gloo) — auto-select free port if None
+    distributed_addr: Optional[str] = None,
+    # GPU visibility (e.g. "0,1") — empty string means inherit CUDA_VISIBLE_DEVICES
+    cuda_visible_devices: str = "",
     # Model / cache
     page_size: int = 16,
     max_running_reqs: int = 256,
@@ -42,6 +68,21 @@ def launch(
     port: int = 8000,
     model_name: str = "leanllm",
 ) -> None:
+    if distributed_addr is None or zmq_backend_addr is None or \
+            zmq_result_addr is None or zmq_broadcast_addr is None:
+        ports = _find_free_ports(4)
+        if distributed_addr is None:
+            distributed_addr = f"tcp://127.0.0.1:{ports[0]}"
+        if zmq_backend_addr is None:
+            zmq_backend_addr = f"tcp://127.0.0.1:{ports[1]}"
+        if zmq_result_addr is None:
+            zmq_result_addr = f"tcp://127.0.0.1:{ports[2]}"
+        if zmq_broadcast_addr is None:
+            zmq_broadcast_addr = f"tcp://127.0.0.1:{ports[3]}"
+    logger.info(
+        "Ports — dist:%s zmq_backend:%s zmq_result:%s zmq_bcast:%s",
+        distributed_addr, zmq_backend_addr, zmq_result_addr, zmq_broadcast_addr,
+    )
     ctx = mp.get_context("spawn")
     procs = []
     readers = []
@@ -60,6 +101,7 @@ def launch(
             max_prefill_tokens=max_prefill_tokens,
             dtype=dtype,
             gpu_memory_utilization=gpu_memory_utilization,
+            cuda_visible_devices=cuda_visible_devices,
         )
         reader, writer = ctx.Pipe(duplex=False)
         p = ctx.Process(

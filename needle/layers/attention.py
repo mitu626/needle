@@ -24,7 +24,8 @@ from ..model.config import ModelConfig
 try:
     from flashinfer.prefill import single_prefill_with_kv_cache as _fi_prefill
     from flashinfer.decode import BatchDecodeWithPagedKVCacheWrapper as _FiDecodeWrapper
-    _HAS_FLASHINFER = True
+    import os as _os
+    _HAS_FLASHINFER = not _os.environ.get("NEEDLE_DISABLE_FLASHINFER", "")
 except ImportError:
     _HAS_FLASHINFER = False
 
@@ -107,16 +108,20 @@ class Attention(nn.Module):
 
     def _prefill_flashinfer(self, q, k, v, cu_seqlens):
         outputs = []
-        for i in range(cu_seqlens.shape[0] - 1):
-            s, e = int(cu_seqlens[i]), int(cu_seqlens[i + 1])
-            outputs.append(_fi_prefill(q[s:e], k[s:e], v[s:e],
-                                       causal=True, sm_scale=self.scale))
+        cu_cpu = cu_seqlens.cpu().tolist()  # avoid per-element CUDA sync
+        for i in range(len(cu_cpu) - 1):
+            s, e = int(cu_cpu[i]), int(cu_cpu[i + 1])
+            outputs.append(_fi_prefill(
+                q[s:e].contiguous(), k[s:e].contiguous(), v[s:e].contiguous(),
+                causal=True, sm_scale=self.scale,
+            ))
         return torch.cat(outputs, dim=0)
 
     def _prefill_pytorch(self, q, k, v, cu_seqlens):
         outputs = []
-        for i in range(cu_seqlens.shape[0] - 1):
-            s, e = int(cu_seqlens[i]), int(cu_seqlens[i + 1])
+        cu_cpu = cu_seqlens.cpu().tolist()  # avoid per-element CUDA sync
+        for i in range(len(cu_cpu) - 1):
+            s, e = int(cu_cpu[i]), int(cu_cpu[i + 1])
             qi = q[s:e].unsqueeze(0).transpose(1, 2)   # [1, H, S, D]
             ki = k[s:e].unsqueeze(0).transpose(1, 2)
             vi = v[s:e].unsqueeze(0).transpose(1, 2)
@@ -136,12 +141,17 @@ class Attention(nn.Module):
         num_seqs   = q.shape[0]
         block_size = kv_cache.shape[3]
         ctx        = context_lens.long()
-        phys       = block_table[torch.arange(num_seqs, device=q.device), ctx // block_size]
-        block_off  = ctx % block_size
+        col_idx    = (ctx // block_size).clamp(max=block_table.shape[1] - 1)
+        phys       = block_table[torch.arange(num_seqs, device=q.device), col_idx].long()
+        block_off  = (ctx % block_size).long()
 
-        # Write new token K/V into cache — vectorized scatter
-        kv_cache[0, phys, :, block_off, :] = k
-        kv_cache[1, phys, :, block_off, :] = v
+        # Write new token K/V into cache — iterate over KV heads to keep
+        # the two advanced indices adjacent (non-adjacent scatter is undefined
+        # in CUDA advanced indexing and triggers device-side assertions).
+        num_kv_heads = kv_cache.shape[2]
+        for h in range(num_kv_heads):
+            kv_cache[0, phys, h, block_off, :] = k[:, h, :]
+            kv_cache[1, phys, h, block_off, :] = v[:, h, :]
 
         if _HAS_FLASHINFER and q.is_cuda and _fi_group_size_ok(self.num_heads, self.num_kv_heads):
             return self._decode_flashinfer(q, kv_cache, block_table, context_lens)
@@ -157,8 +167,9 @@ class Attention(nn.Module):
         indptr = torch.zeros(num_seqs + 1, dtype=torch.int32, device=q.device)
         indptr[1:] = num_blocks_per_seq.cumsum(0)
 
+        nbs = num_blocks_per_seq.cpu().tolist()  # avoid per-element CUDA sync
         indices = torch.cat([
-            block_table[i, :int(num_blocks_per_seq[i])]
+            block_table[i, :int(nbs[i])]
             for i in range(num_seqs)
         ]).to(torch.int32)
 
@@ -170,7 +181,7 @@ class Attention(nn.Module):
                 32 * 1024 * 1024, dtype=torch.uint8, device=q.device
             )
         if self._decode_wrapper is None:
-            self._decode_wrapper = _FiDecodeWrapper(self._decode_workspace)
+            self._decode_wrapper = _FiDecodeWrapper(self._decode_workspace, kv_layout="HND")
 
         wrapper = self._decode_wrapper
         wrapper.begin_forward(
@@ -181,7 +192,7 @@ class Attention(nn.Module):
             page_size=block_size,
             q_data_type=q.dtype,
         )
-        out = wrapper.forward(q, kv_cache[0], kv_cache[1], sm_scale=self.scale)
+        out = wrapper.forward(q, (kv_cache[0], kv_cache[1]), sm_scale=self.scale)
         wrapper.end_forward()
         return out  # [num_seqs, num_heads, head_dim]
 
@@ -208,9 +219,11 @@ def _write_kv(
     seq_lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).long()
 
     # Absolute KV position for every token in the batch
+    ctx_lens_cpu = context_lens.cpu().tolist()    # avoid per-element CUDA sync
+    seq_lens_cpu = seq_lengths.cpu().tolist()
     abs_pos = torch.cat([
-        torch.arange(int(context_lens[i]),
-                     int(context_lens[i]) + int(seq_lengths[i]),
+        torch.arange(int(ctx_lens_cpu[i]),
+                     int(ctx_lens_cpu[i]) + int(seq_lens_cpu[i]),
                      device=k.device, dtype=torch.long)
         for i in range(batch_size)
     ])  # [total_tokens]
@@ -219,11 +232,18 @@ def _write_kv(
         torch.arange(batch_size, device=k.device, dtype=torch.long), seq_lengths
     )  # [total_tokens]
 
-    phys      = block_table[seq_idx, abs_pos // block_size]  # [total_tokens]
-    block_off = abs_pos % block_size                          # [total_tokens]
+    col_idx   = (abs_pos // block_size).clamp(max=block_table.shape[1] - 1)
+    phys      = block_table[seq_idx, col_idx].long()
+    block_off = (abs_pos % block_size).long()
 
-    kv_cache[0, phys, :, block_off, :] = k
-    kv_cache[1, phys, :, block_off, :] = v
+    # Iterate over KV heads to keep the two advanced indices (phys, block_off)
+    # adjacent — non-adjacent CUDA scatter triggers device-side assertions.
+    num_kv_heads = kv_cache.shape[2]
+    kv0 = kv_cache[0]  # [num_blocks, num_kv_heads, block_size, head_dim]
+    kv1 = kv_cache[1]
+    for h in range(num_kv_heads):
+        kv0[phys, h, block_off] = k[:, h, :]
+        kv1[phys, h, block_off] = v[:, h, :]
 
 
 # ---------------------------------------------------------------------------
@@ -274,8 +294,9 @@ def _decode_pytorch(q, kv_cache, block_table, context_lens, scale,
     num_seqs   = q.shape[0]
     block_size = kv_cache.shape[3]
     outputs    = []
+    ctx_lens_cpu = context_lens.cpu().tolist()  # avoid per-element CUDA sync
     for i in range(num_seqs):
-        ctx_len = int(context_lens[i]) + 1
+        ctx_len = int(ctx_lens_cpu[i]) + 1
         nb      = (ctx_len + block_size - 1) // block_size
         phys    = block_table[i, :nb]
         k_full  = kv_cache[0][phys].transpose(0, 1).reshape(num_kv_heads, -1, head_dim)[:, :ctx_len]

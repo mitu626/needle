@@ -134,14 +134,21 @@ class Scheduler:
         )
 
     def free_sequence(self, seq: Sequence) -> None:
-        """Release all blocks for a finished sequence."""
+        """Release all blocks for a finished sequence.
+
+        Bug #6 fix: use discard-style removal so calling free_sequence
+        twice (double-free) does not raise an exception.
+        """
         if seq.seq_id in self._block_tables:
             self.allocator.free_gpu_blocks(self._block_tables.pop(seq.seq_id))
         if seq.seq_id in self._cpu_block_tables:
             self.allocator.free_cpu_blocks(self._cpu_block_tables.pop(seq.seq_id))
         seq.finish()
-        if seq in self.running:
+        # Use discard-style removal to avoid ValueError on double-free
+        try:
             self.running.remove(seq)
+        except ValueError:
+            pass
 
     def has_unfinished_seqs(self) -> bool:
         return bool(self.waiting or self.running or self.swapped)

@@ -61,6 +61,9 @@ class SchedulerConfig:
     # Scheduling
     disable_overlap: bool = False   # overlap TODO: enable after Option-B refactor
 
+    # GPU visibility — passed to subprocess via os.environ before CUDA init
+    cuda_visible_devices: str = ""  # empty means inherit from parent
+
 
 # ---------------------------------------------------------------------------
 # Scheduler process
@@ -77,6 +80,7 @@ class BackendProc(SchedulerIOMixin):
 
     def __init__(self, config: SchedulerConfig, cpu_group: dist.ProcessGroup) -> None:
         from .engine import LLMEngine
+        from transformers import AutoTokenizer
 
         self.config = config
         self.engine = LLMEngine(
@@ -87,6 +91,14 @@ class BackendProc(SchedulerIOMixin):
             gpu_memory_utilization=config.gpu_memory_utilization,
             tensor_parallel_size=config.tp_size,
             dtype=config.dtype,
+        )
+
+        # Bug #5: load tokenizer to get eos_token_id for stop condition
+        tokenizer = AutoTokenizer.from_pretrained(
+            config.model_path, trust_remote_code=True
+        )
+        self._default_stop_ids: List[int] = (
+            [tokenizer.eos_token_id] if tokenizer.eos_token_id is not None else []
         )
 
         # SchedulerIOMixin sets up ZMQ sockets based on tp_rank
@@ -132,11 +144,17 @@ class BackendProc(SchedulerIOMixin):
 
     def _handle_user_msg(self, msg: UserMsg) -> None:
         params_dict = msg.sampling_params
+        # Bug #5: merge eos_token_id into stop_token_ids so generation stops naturally
+        stop_ids = list(self._default_stop_ids)
+        for sid in params_dict.get("stop_token_ids", []):
+            if sid not in stop_ids:
+                stop_ids.append(sid)
         sampling_params = SamplingParams(
             temperature=params_dict.get("temperature", 1.0),
             top_p=params_dict.get("top_p", 1.0),
             top_k=params_dict.get("top_k", -1),
             max_new_tokens=params_dict.get("max_new_tokens", 512),
+            stop_token_ids=stop_ids,
         )
         self.engine.add_request(
             request_id=str(msg.uid),
@@ -234,6 +252,9 @@ def run_backend_process(
     pipe_writer: Optional[mp.connection.Connection] = None,
 ) -> None:
     """Entry point for each TP rank subprocess."""
+    import os
+    if config.cuda_visible_devices:
+        os.environ["CUDA_VISIBLE_DEVICES"] = config.cuda_visible_devices
     torch.cuda.set_device(config.tp_rank)
 
     cpu_group = _init_distributed(config)

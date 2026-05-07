@@ -173,6 +173,11 @@ async def _stream_chat(
     )
     q = _client._queues[uid]
 
+    # Bug #11 fix: accumulate tokens and use incremental decode to avoid
+    # UTF-8 split artefacts for multi-byte characters (e.g. Chinese).
+    generated_ids: list = []
+    prev_text = ""
+
     try:
         while True:
             # Check for client disconnect before each token
@@ -181,14 +186,19 @@ async def _stream_chat(
                 return
 
             token, finished = await q.get()
-            text = _tokenizer.decode([token], skip_special_tokens=True)
+            generated_ids.append(token)
+
+            # Decode the full sequence so far; only emit the new suffix.
+            new_text = _tokenizer.decode(generated_ids, skip_special_tokens=True)
+            delta = new_text[len(prev_text):]
+            prev_text = new_text
 
             chunk = ChatCompletionStreamResponse(
                 id=rid,
                 model=model_name,
                 choices=[
                     ChatCompletionStreamChoice(
-                        delta=ChatCompletionDelta(content=text),
+                        delta=ChatCompletionDelta(content=delta),
                         finish_reason="stop" if finished else None,
                     )
                 ],

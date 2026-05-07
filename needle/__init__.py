@@ -1,6 +1,7 @@
-"""LeanLLM — lean, fast LLM inference engine."""
+"""Needle — sharp, lightweight LLM inference engine."""
 from .backend import LLMEngine, SamplingParams
+from .llm import LLM
 from .serving import serve
 
 __version__ = "0.1.0"
-__all__ = ["LLMEngine", "SamplingParams", "serve"]
+__all__ = ["LLM", "LLMEngine", "SamplingParams", "serve"]

@@ -19,7 +19,7 @@ class ModelRunner:
         model_config: ModelConfig,
         block_size: int = 16,
         dtype: str = "bfloat16",
-        device: str = "cuda",
+        device: str = "cuda:2",
         tensor_parallel_size: int = 1,
         tp_rank: int = 0,
     ):
@@ -63,9 +63,9 @@ class ModelRunner:
         return num_gpu_blocks, num_cpu_blocks
 
     def init_kv_cache(self, num_gpu_blocks: int, num_cpu_blocks: int) -> None:
-        """Allocate KV cache tensors for all layers."""
+        """Allocate KV cache tensors for all layers on GPU and CPU."""
         cfg = self.model_config
-        kv_shape = (
+        gpu_kv_shape = (
             2,                   # K, V
             num_gpu_blocks,
             cfg.num_kv_heads,
@@ -73,35 +73,123 @@ class ModelRunner:
             cfg.head_dim,
         )
         self.kv_caches = [
-            torch.zeros(kv_shape, dtype=self.dtype, device=self.device)
+            torch.zeros(gpu_kv_shape, dtype=self.dtype, device=self.device)
             for _ in range(cfg.num_hidden_layers)
         ]
+
+        # Bug #8: allocate CPU swap buffers (pin_memory for fast DMA)
+        if num_cpu_blocks > 0:
+            cpu_kv_shape = (
+                2,
+                num_cpu_blocks,
+                cfg.num_kv_heads,
+                self.block_size,
+                cfg.head_dim,
+            )
+            self.cpu_kv_caches = [
+                torch.zeros(cpu_kv_shape, dtype=self.dtype, device="cpu", pin_memory=True)
+                for _ in range(cfg.num_hidden_layers)
+            ]
+        else:
+            self.cpu_kv_caches = []
 
     # ------------------------------------------------------------------
 
     def execute(self, sched_out: SchedulerOutput) -> ExecuteOutput:
-        """Build ExecuteInput and run one model forward pass."""
-        execute_input = self._prepare_inputs(sched_out)
-        with torch.no_grad():
-            logits = self.model(
-                input_ids=execute_input.input_ids,
-                positions=execute_input.position_ids,
-                kv_caches=self.kv_caches,
-                block_table=execute_input.block_table,
-                cu_seqlens=execute_input.cu_seqlens,
-                context_lens=execute_input.context_lens,
-                max_seqlen=execute_input.max_seqlen,
-                is_prefill=execute_input.is_prefill,
+        """Build ExecuteInput and run forward pass(es).
+
+        Bug #4 fix: when both prefill and decode sequences are present,
+        run two separate forward passes so each uses the correct attention
+        kernel (varlen prefill vs. paged decode).  Sampling results are
+        concatenated in the original prefill+decode order.
+        """
+        # Bug #7 fix: execute swap operations before the forward pass
+        if sched_out.swap_out_map and self.cpu_kv_caches:
+            self._swap_kv_blocks(
+                self.kv_caches, self.cpu_kv_caches, sched_out.swap_out_map,
+                direction="gpu_to_cpu"
+            )
+        if sched_out.swap_in_map and self.cpu_kv_caches:
+            self._swap_kv_blocks(
+                self.kv_caches, self.cpu_kv_caches, sched_out.swap_in_map,
+                direction="cpu_to_gpu"
             )
 
-        all_seqs = sched_out.prefill_seqs + sched_out.decode_seqs
+        prefill_token_ids: List[int] = []
+        decode_token_ids: List[int] = []
+
+        if sched_out.prefill_seqs and sched_out.decode_seqs:
+            # Mixed batch: two separate forward passes
+            prefill_input = self._prepare_inputs(
+                SchedulerOutput(
+                    prefill_seqs=sched_out.prefill_seqs,
+                    decode_seqs=[],
+                    block_tables=sched_out.block_tables,
+                    swap_in_map={},
+                    swap_out_map={},
+                    blocks_to_free=[],
+                )
+            )
+            decode_input = self._prepare_inputs(
+                SchedulerOutput(
+                    prefill_seqs=[],
+                    decode_seqs=sched_out.decode_seqs,
+                    block_tables=sched_out.block_tables,
+                    swap_in_map={},
+                    swap_out_map={},
+                    blocks_to_free=[],
+                )
+            )
+            with torch.no_grad():
+                prefill_logits = self._forward(prefill_input)
+                decode_logits = self._forward(decode_input)
+
+            all_seqs = sched_out.prefill_seqs + sched_out.decode_seqs
+            all_logits = torch.cat([prefill_logits, decode_logits], dim=0)
+        else:
+            execute_input = self._prepare_inputs(sched_out)
+            with torch.no_grad():
+                all_logits = self._forward(execute_input)
+            all_seqs = sched_out.prefill_seqs + sched_out.decode_seqs
+
         sampling_params = [seq.request.sampling_params for seq in all_seqs]
-        next_token_ids = self.sampler.sample(logits, sampling_params)
+        next_token_ids = self.sampler.sample(all_logits, sampling_params)
 
         return ExecuteOutput(
             seq_ids=[s.seq_id for s in all_seqs],
             next_token_ids=next_token_ids,
         )
+
+    def _forward(self, execute_input: "ExecuteInput") -> torch.Tensor:
+        return self.model(
+            input_ids=execute_input.input_ids,
+            positions=execute_input.position_ids,
+            kv_caches=self.kv_caches,
+            block_table=execute_input.block_table,
+            cu_seqlens=execute_input.cu_seqlens,
+            context_lens=execute_input.context_lens,
+            max_seqlen=execute_input.max_seqlen,
+            is_prefill=execute_input.is_prefill,
+        )
+
+    def _swap_kv_blocks(
+        self,
+        gpu_caches: List[torch.Tensor],
+        cpu_caches: List[torch.Tensor],
+        mapping: dict,
+        direction: str,
+    ) -> None:
+        """Copy KV blocks between GPU and CPU caches.
+
+        direction: "gpu_to_cpu" for swap-out, "cpu_to_gpu" for swap-in.
+        mapping keys/values are physical block ids on the source/destination.
+        """
+        for layer_idx, (gpu_cache, cpu_cache) in enumerate(zip(gpu_caches, cpu_caches)):
+            for src_id, dst_id in mapping.items():
+                if direction == "gpu_to_cpu":
+                    cpu_cache[:, dst_id] = gpu_cache[:, src_id].to("cpu", non_blocking=True)
+                else:
+                    gpu_cache[:, dst_id] = cpu_cache[:, src_id].to(self.device, non_blocking=True)
 
     def _prepare_inputs(self, sched_out: SchedulerOutput) -> ExecuteInput:
         """Convert SchedulerOutput into batched tensors."""
@@ -135,10 +223,15 @@ class ModelRunner:
             for s in all_seqs
         ) if all_seqs else 1
 
+        # Bug #9: use the last block in kv_caches as a dummy padding block so
+        # that out-of-range padding slots never alias real KV data.
+        num_gpu_blocks = self.kv_caches[0].shape[1] if self.kv_caches else 1
+        dummy_block_id = num_gpu_blocks - 1
+
         block_table_data = []
         for seq in all_seqs:
             blocks = sched_out.block_tables.get(seq.seq_id, [])
-            padded = blocks + [0] * (max_blocks - len(blocks))
+            padded = blocks + [dummy_block_id] * (max_blocks - len(blocks))
             block_table_data.append(padded)
 
         dev = self.device

@@ -30,7 +30,7 @@ dev = [
 ]
 
 [project.scripts]
-needle-serve = "needle.serving.server:serve"
+needle = "needle.__main__:launch_server"
 
 [tool.setuptools.packages.find]
 where = ["."]

@@ -132,7 +132,7 @@ class LlamaForCausalLM(nn.Module):
             cu_seqlens, context_lens, max_seqlen, is_prefill,
         )
         if is_prefill:
-            last_indices = cu_seqlens[1:] - 1  # [batch]
+            last_indices = (cu_seqlens[1:] - 1).long()  # [batch] — must be int64 for indexing
             last_hidden = hidden[last_indices]
         else:
             last_hidden = hidden  # decode: one token per seq
